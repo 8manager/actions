@@ -32,5 +32,16 @@ jobs:
 Releases are tagged `vX.Y.Z`, with a moving `v1` tag for the latest 1.x. The 8Manager app pins the
 generated workflow to a release **commit SHA** (with the version in a comment), so nothing changes in
 your CI until you merge an update — Dependabot (`github-actions` ecosystem) opens those PRs for you.
-Never reference `@main`. The workflows pin their own tools too (Trivy, Opengrep, Polaris and the
-structure analyzer are version-pinned and checksum-verified).
+Never reference `@main`.
+
+What the workflows themselves pin:
+
+- **Third-party actions** — by commit SHA (version in a comment).
+- **Trivy, Opengrep, Polaris binaries and the structure analyzer** — exact version/commit + sha256 checked.
+- **Opengrep rules** — a fixed commit of `opengrep/opengrep-rules`.
+- **Python / npm packages** (lizard, tree-sitter, tree-sitter-language-pack, jscpd) — exact versions
+  (`==` / `@x.y.z`), without a hash lockfile; their transitive dependencies and the grammars
+  `tree-sitter-language-pack` downloads at run time are resolved by their registries.
+- **Runner** — `ubuntu-latest`. **Drift's Terraform** — your `terraform-version` input (default `latest`).
+
+Every scanner step is non-blocking: a failure is reported as a warning and never fails your build.

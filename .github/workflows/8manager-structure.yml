@@ -6,8 +6,8 @@ name: 8Manager structure
 # findings (kind, file, symbol, line, confidence, is_ai_marked), never source text. NON-BLOCKING: an
 # 8Manager outage must never break the caller.
 #
-# Twin of Runs in the customer repo: a repo's combined 8manager-scan.yml `uses:` it alongside
-# 8manager-security.yml and 8manager-quality.yml.
+# A customer repo's combined 8manager-scan.yml `uses:` it alongside 8manager-security.yml and
+# 8manager-quality.yml.
 
 on:
   workflow_call:
@@ -41,10 +41,10 @@ jobs:
         run: |
           set -euo pipefail
           pip install --quiet tree-sitter==0.26.0 tree-sitter-language-pack==1.20.0
-          # The analyzer is published alongside this workflow in 8manager/actions, fetched at the tag of
-          # the release that last CHANGED it and checksum-verified, so a later push can never change what
+          # The analyzer is published alongside this workflow in 8manager/actions, fetched at the COMMIT of
+          # the release that last changed it and checksum-verified, so a later push can never change what
           # runs here. Bump ANALYZER_REF + ANALYZER_SHA256 together whenever the analyzer changes.
-          ANALYZER_REF="v1.0.0"
+          ANALYZER_REF="96d4df43b5b994b3a189d3b6b2248b39059e574f" # v1.0.0 (unchanged since)
           ANALYZER_SHA256="ac8cffcfd37ece871de2f5b487229c0750fbd217b82a93034117db8493c8823d"
           curl -sSfL "https://raw.githubusercontent.com/8manager/actions/${ANALYZER_REF}/tools/structure_analyzer.py" \
             -o structure_analyzer.py

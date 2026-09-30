@@ -5,8 +5,8 @@ name: 8Manager quality
 # fallback that covers repositories with no SonarCloud analysis. Everything sent is a measured number;
 # nothing is invented. Reporting is NON-BLOCKING — an 8Manager outage must never break the caller.
 #
-# So a customer repo's combined 8manager-scan.yml can `uses:` it
-# alongside 8manager-security.yml (one workflow feeds both the Security and Code-quality pages).
+# A customer repo's combined 8manager-scan.yml `uses:` it alongside 8manager-security.yml (one workflow
+# feeds both the Security and Code-quality pages).
 
 on:
   workflow_call:
@@ -36,6 +36,7 @@ jobs:
           python-version: "3.12"
 
       - name: Analyze complexity with lizard
+        continue-on-error: true # non-blocking
         run: |
           set -euo pipefail
           pip install --quiet lizard==1.24.0

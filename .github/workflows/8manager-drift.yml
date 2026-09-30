@@ -70,6 +70,8 @@ jobs:
       - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
           terraform_version: ${{ inputs.terraform-version }}
+          # Raw terraform binary: the wrapper injects extra stdout and breaks `terraform show -json > plan.json`.
+          terraform_wrapper: false
 
       - name: Pre-plan build
         if: inputs.pre-plan-command != ''
@@ -134,7 +136,7 @@ jobs:
               upload_url=$(echo "$presign" | jq -r '.upload_url')
               s3_key=$(echo "$presign" | jq -r '.s3_key')
               [ -n "$upload_url" ] && [ "$upload_url" != "null" ] || { echo "no presign url"; return 1; }
-              curl -sS -X PUT --upload-file plan.json -H "Content-Type: application/json" "$upload_url" || return 1
+              curl -sSf -X PUT --upload-file plan.json -H "Content-Type: application/json" "$upload_url" || return 1
               body=$(jq -n --arg repo "$repo" --arg sha "$sha" --arg run "$run" --arg key "$s3_key" \
                 '{repository:$repo, commit_sha:$sha, run_id:$run, mode:"drift", s3_key:$key}')
               printf '%s' "$body" > body.json

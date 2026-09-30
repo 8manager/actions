@@ -56,28 +56,35 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Trivy config + filesystem scan
+        continue-on-error: true # non-blocking: a scanner failure must never fail the caller's build
         working-directory: ${{ inputs.working-directory }}
+        env:
+          SEVERITY: ${{ inputs.severity }}
+          SKIP_CHECK_UPDATE: ${{ inputs.skip-check-update }}
         run: |
           set -euo pipefail
-          # Pinned: the installer script AND the Trivy version come from one release tag, so a push to
-          # Trivy's main can never change what runs here. The installer verifies the release checksum.
-          TRIVY_VERSION="v0.74.0"
-          curl -sfL "https://raw.githubusercontent.com/aquasecurity/trivy/${TRIVY_VERSION}/contrib/install.sh" \
-            | sh -s -- -b /usr/local/bin "${TRIVY_VERSION}"
+          # Pinned binary + sha256 (no installer script): nothing Trivy publishes later changes what runs here.
+          TRIVY_VERSION="0.74.0"
+          TRIVY_SHA256="2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a"
+          TGZ="$RUNNER_TEMP/trivy.tar.gz"
+          curl -sfL -o "$TGZ" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  ${TGZ}" | sha256sum -c -
+          tar -xz -C /usr/local/bin -f "$TGZ" trivy
           # `config` finds Terraform/Kubernetes/Dockerfile misconfiguration — the class GitHub-native
           # tooling does NOT cover, and the reason this scan exists.
           SKIP=""
-          [ "${{ inputs.skip-check-update }}" = "true" ] && SKIP="--skip-check-update"
+          [ "$SKIP_CHECK_UPDATE" = "true" ] && SKIP="--skip-check-update"
           # Skip vendored + build directories. `fs --scanners vuln` reads the dependency tree from the
           # LOCKFILE, so it loses no coverage by not walking node_modules/.venv; scanning them just
           # re-reports installed copies and can blow past the 200 KB ingest cap. Quoted so the shell
           # does not glob-expand the patterns — Trivy does its own matching.
           SKIPDIRS="**/node_modules,**/.venv,**/vendor,infra/worker-layer/**,infra/.terraform/**,**/dist,**/build,**/.git"
-          trivy config . $SKIP --skip-dirs "$SKIPDIRS" --format json --severity "${{ inputs.severity }}" --quiet > trivy-config.json
+          trivy config . $SKIP --skip-dirs "$SKIPDIRS" --format json --severity "$SEVERITY" --quiet > trivy-config.json
           # `fs` finds vulnerable dependencies and secrets. 8Manager drops whichever of these GitHub
           # already surfaces on this repo, per repository, so the overlap is decided from what is
           # actually enabled rather than assumed.
-          trivy fs . --skip-dirs "$SKIPDIRS" --format json --severity "${{ inputs.severity }}" \
+          trivy fs . --skip-dirs "$SKIPDIRS" --format json --severity "$SEVERITY" \
             --scanners vuln,secret --quiet > trivy-fs.json
           # Keep ONLY the fields 8Manager reads (app/scan/normalize.py from_trivy). Raw Trivy JSON carries
           # full advisories, CVSS vectors and every reference URL per CVE — on a real app that is ~1 MB
@@ -104,6 +111,7 @@ jobs:
       - name: Opengrep SAST scan
         working-directory: ${{ inputs.working-directory }}
         env:
+          SEVERITY: ${{ inputs.severity }}
           RULES_DIR: ${{ runner.temp }}/opengrep-rules
           # Opengrep 1.25 reads rule YAML with the ASCII codec and aborts on a non-UTF-8 locale — pin
           # a UTF-8 locale so the rule load never crashes on a runner whose default is C/POSIX.
@@ -151,7 +159,7 @@ jobs:
           # cap. WARNING is added back only when the caller asks for MEDIUM. Vendored/build trees are
           # already outside Opengrep's default walk, so no --exclude is needed.
           OG_SEV="--severity ERROR"
-          case ",${{ inputs.severity }}," in *,MEDIUM,*) OG_SEV="$OG_SEV --severity WARNING";; esac
+          case ",$SEVERITY," in *,MEDIUM,*) OG_SEV="$OG_SEV --severity WARNING";; esac
           if [ -n "$OG" ] && [ -n "$CFG" ]; then
             "$OG" scan $CFG $OG_SEV \
               --json --quiet --timeout 60 . > semgrep-raw.json 2> semgrep.err || true
@@ -171,6 +179,9 @@ jobs:
 
       - name: Polaris audit (optional)
         if: inputs.manifests-directory != ''
+        continue-on-error: true
+        env:
+          MANIFESTS_DIR: ${{ inputs.manifests-directory }}
         run: |
           set -euo pipefail
           # Pinned + checksum-verified (never `releases/latest`: it changes under us — its asset name
@@ -182,7 +193,7 @@ jobs:
             "https://github.com/FairwindsOps/polaris/releases/download/v${POLARIS_VERSION}/polaris_${POLARIS_VERSION}_linux_amd64.tar.gz"
           echo "${POLARIS_SHA256}  ${TGZ}" | sha256sum -c -
           tar -xz -C /usr/local/bin -f "$TGZ" polaris
-          polaris audit --audit-path "${{ inputs.manifests-directory }}" --format json > polaris.json
+          polaris audit --audit-path "$MANIFESTS_DIR" --format json > polaris.json
           echo "polaris.json is $(wc -c < polaris.json) bytes"
 
       - name: Report findings to 8Manager (non-blocking)
