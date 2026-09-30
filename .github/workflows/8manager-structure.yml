@@ -1,0 +1,67 @@
+name: 8Manager structure
+
+# SP-69 reusable workflow: run 8Manager's OWN structural analysis (semantic duplication + dead code via
+# a Tree-sitter call/reference graph) IN THE CUSTOMER'S CI and post ONLY the derived findings to
+# /ingest/structure-results. The customer's source NEVER leaves their runner — the analyzer prints
+# findings (kind, file, symbol, line, confidence, is_ai_marked), never source text. NON-BLOCKING: an
+# 8Manager outage must never break the caller.
+#
+# Twin of Runs in the customer repo: a repo's combined 8manager-scan.yml `uses:` it alongside
+# 8manager-security.yml and 8manager-quality.yml.
+
+on:
+  workflow_call:
+    inputs:
+      api-url:
+        description: "Base URL of the 8Manager API (no trailing slash)."
+        type: string
+        default: "https://khnmus0i56.execute-api.us-east-1.amazonaws.com"
+
+permissions:
+  id-token: write # mint the 8manager-ingest OIDC token
+  contents: read
+
+jobs:
+  structure:
+    runs-on: ubuntu-latest
+    env:
+      API_URL: ${{ inputs.api-url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the AI cross-cut can git-blame each finding's region to its commit.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Analyze code structure
+        continue-on-error: true # never fail the caller's pipeline
+        run: |
+          set -euo pipefail
+          pip install --quiet tree-sitter "tree-sitter-language-pack>=0.9"
+          # The analyzer is published alongside this workflow in hugofe/8manager-actions, fetched read-only.
+          curl -sSfL "https://raw.githubusercontent.com/hugofe/8manager-actions/main/tools/structure_analyzer.py" \
+            -o structure_analyzer.py
+          # Emits ONLY derived findings as JSON — the repo's source stays on this runner.
+          python structure_analyzer.py . > findings.json
+          python -c "import json;d=json.load(open('findings.json'));print('structure findings:',len(d['findings']))"
+
+      - name: Post findings to 8Manager
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          [ -f findings.json ] || { echo "no findings.json (analysis skipped); nothing to post"; exit 0; }
+          send() {
+            local id_token code
+            id_token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=8manager-ingest" | jq -r '.value')
+            [ -n "$id_token" ] && [ "$id_token" != "null" ] || { echo "could not mint OIDC token"; return 1; }
+            code=$(curl -sS -o /tmp/st-resp -w '%{http_code}' -X POST "$API_URL/ingest/structure-results" \
+              -H "Authorization: Bearer $id_token" -H "Content-Type: application/json" \
+              --data-binary @findings.json)
+            [ "$code" = "202" ] || { echo "ingest returned $code"; cat /tmp/st-resp; return 1; }
+            echo "posted structural findings"
+          }
+          if ! send; then echo "structure post failed (non-blocking)"; fi

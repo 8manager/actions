@@ -1,0 +1,154 @@
+name: 8Manager quality
+
+# SP-65 reusable workflow: run 8Manager's OWN code-quality scan (lizard cyclomatic complexity + jscpd
+# duplication, weighted by 90-day churn) and post the summary to /ingest/quality-results. This is the
+# fallback that covers repositories with no SonarCloud analysis. Everything sent is a measured number;
+# nothing is invented. Reporting is NON-BLOCKING — an 8Manager outage must never break the caller.
+#
+# So a customer repo's combined 8manager-scan.yml can `uses:` it
+# alongside 8manager-security.yml (one workflow feeds both the Security and Code-quality pages).
+
+on:
+  workflow_call:
+    inputs:
+      api-url:
+        description: "Base URL of the 8Manager API (no trailing slash)."
+        type: string
+        default: "https://khnmus0i56.execute-api.us-east-1.amazonaws.com"
+
+permissions:
+  id-token: write # mint the 8manager-ingest OIDC token
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    env:
+      API_URL: ${{ inputs.api-url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so per-file churn (git log over the last 90 days) is real, not shallow.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Analyze complexity with lizard
+        run: |
+          set -euo pipefail
+          pip install --quiet lizard
+          git log --since="90 days ago" --name-only --pretty=format: -- . \
+            | grep -v '^$' | sort | uniq -c | awk '{c=$1; $1=""; sub(/^ /,""); print c"\t"$0}' \
+            > churn.tsv || true
+          python - <<'PY' > summary.json
+          import json, os, lizard
+          EXCL = ("/node_modules/", "/.venv/", "/venv/", "/dist/", "/.git/",
+                  "/.terraform/", "/build/", "/worker-layer/", "/site-packages/")
+          THRESH = 15
+          TOP_N = 20
+          SNIP_MAX = 1200
+          churn = {}
+          try:
+              with open("churn.tsv") as fh:
+                  for line in fh:
+                      c, _, p = line.partition("\t")
+                      p = p.strip()
+                      if p:
+                          churn[p] = int(c.strip())
+          except OSError:
+              pass
+
+          def _rel(fn):
+              return fn[2:] if fn.startswith("./") else fn
+
+          def _snippet(path, start, end):
+              try:
+                  with open(path, encoding="utf-8", errors="replace") as fh:
+                      lines = fh.readlines()
+              except OSError:
+                  return None
+              body = "".join(lines[max(0, start - 1):end])
+              return body[:SNIP_MAX]
+
+          total_nloc = 0
+          ccns, lengths, warnings = [], [], 0
+          hotspots = []
+          for f in lizard.analyze(["."]):
+              path = "/" + f.filename.lstrip("./")
+              if any(e in path for e in EXCL):
+                  continue
+              rel = _rel(f.filename)
+              total_nloc += f.nloc
+              for fn in f.function_list:
+                  ccns.append(fn.cyclomatic_complexity)
+                  lengths.append(fn.length)
+                  if fn.cyclomatic_complexity > THRESH:
+                      warnings += 1
+                      hotspots.append({
+                          "file": rel,
+                          "function": fn.name,
+                          "ccn": fn.cyclomatic_complexity,
+                          "nloc": fn.length,
+                          "start_line": fn.start_line,
+                          "end_line": fn.end_line,
+                          "changes_90d": churn.get(rel, 0),
+                          "snippet": _snippet(f.filename, fn.start_line, fn.end_line),
+                      })
+          fc = len(ccns)
+          hotspots.sort(key=lambda h: h["ccn"], reverse=True)
+          summary = {
+              "nloc": total_nloc,
+              "function_count": fc,
+              "avg_ccn": round(sum(ccns) / fc, 2) if fc else None,
+              "max_ccn": max(ccns) if ccns else None,
+              "high_ccn_count": sum(1 for c in ccns if c > THRESH),
+              "avg_func_nloc": round(sum(lengths) / fc, 2) if fc else None,
+              "warning_count": warnings,
+          }
+          with open("hotspots.json", "w") as fh:
+              json.dump(hotspots[:TOP_N], fh)
+          print(json.dumps(summary))
+          PY
+          echo "summary: $(cat summary.json)"
+          echo "hotspots: $(wc -c < hotspots.json) bytes"
+
+      - name: Detect duplication with jscpd
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          npx --yes jscpd@4 . --reporters json --silent --gitignore \
+            --ignore "**/node_modules/**,**/.venv/**,**/venv/**,**/dist/**,**/build/**,**/worker-layer/**,**/.terraform/**,**/site-packages/**" \
+            --output /tmp/jscpd >/dev/null 2>&1 || true
+          if [ -f /tmp/jscpd/jscpd-report.json ]; then
+            jq -s '.[0] * (.[1].statistics.total | {duplication_pct: .percentage,
+                    duplicated_lines: .duplicatedLines, duplicated_blocks: .clones})' \
+              summary.json /tmp/jscpd/jscpd-report.json > summary.merged.json \
+              && mv summary.merged.json summary.json
+          fi
+          echo "summary+dup: $(cat summary.json)"
+
+      - name: Report to 8Manager (non-blocking)
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          id_token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=8manager-ingest" | jq -r '.value')
+          [ -n "$id_token" ] && [ "$id_token" != "null" ] || { echo "could not mint OIDC token"; exit 1; }
+
+          branch="${GITHUB_REF_NAME:-main}"
+          [ -f hotspots.json ] || echo '[]' > hotspots.json
+          jq -n --slurpfile m summary.json --slurpfile h hotspots.json \
+            --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" --arg branch "$branch" \
+            '{repository:$repo, commit_sha:$sha, branch:$branch, tool:"lizard",
+              metrics:$m[0], hotspots:$h[0]}' \
+            > body.json
+          echo "payload: $(wc -c < body.json) bytes"
+
+          code=$(curl -sS -o /tmp/q-resp -w '%{http_code}' -X POST "$API_URL/ingest/quality-results" \
+            -H "Authorization: Bearer $id_token" -H "Content-Type: application/json" \
+            --data-binary @body.json)
+          echo "8Manager /ingest/quality-results -> HTTP $code"
+          cat /tmp/q-resp || true
+          [ "$code" = "202" ]

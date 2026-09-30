@@ -1,0 +1,205 @@
+name: 8Manager scan
+
+# SP-23 reusable workflow: run OSS scanners and post the findings to 8Manager, which scores them by
+# service context and surfaces the few that matter.
+#
+# Scanners: Trivy (dependencies, IaC misconfiguration, secrets) and Opengrep (SAST — static code
+# analysis), plus optional Polaris (Kubernetes). Together they cover the axes SonarCloud does, without
+# requiring the customer to connect anything.
+#
+# 8Manager competes with the scanner's NOISE, not with the scanner. These will happily report hundreds
+# of findings; the product's job is to say which handful deserve attention this week and why.
+#
+# Reporting is NON-BLOCKING, like the other 8Manager workflows: an outage must never break the caller.
+# Note this workflow does NOT fail on findings — SP-18's check run is the blocking surface; this one
+# is a scorecard, and a scorecard that fails builds on day one gets deleted on day two.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory to scan."
+        type: string
+        default: "."
+      severity:
+        description: "Minimum Trivy severity to report. Narrow this if reports exceed the size cap."
+        type: string
+        default: "MEDIUM,HIGH,CRITICAL"
+      service:
+        description: "Service name these findings belong to (drives exposure/criticality scoring)."
+        type: string
+        default: ""
+      manifests-directory:
+        description: "Optional: rendered Kubernetes manifests for Polaris to audit."
+        type: string
+        default: ""
+      skip-check-update:
+        description: >
+          Use Trivy's embedded checks instead of pulling the bundle from its OCI registry. Set true
+          on runners without egress to ghcr.io — otherwise Trivy blocks on the download and then
+          times out the scan itself.
+        type: boolean
+        default: false
+      api-url:
+        description: "Base URL of the 8Manager API (no trailing slash)."
+        type: string
+        default: "https://khnmus0i56.execute-api.us-east-1.amazonaws.com"
+
+permissions:
+  id-token: write # mint the 8manager-ingest OIDC token
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy config + filesystem scan
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+          # `config` finds Terraform/Kubernetes/Dockerfile misconfiguration — the class GitHub-native
+          # tooling does NOT cover, and the reason this scan exists.
+          SKIP=""
+          [ "${{ inputs.skip-check-update }}" = "true" ] && SKIP="--skip-check-update"
+          # Skip vendored + build directories. `fs --scanners vuln` reads the dependency tree from the
+          # LOCKFILE, so it loses no coverage by not walking node_modules/.venv; scanning them just
+          # re-reports installed copies and can blow past the 200 KB ingest cap. Quoted so the shell
+          # does not glob-expand the patterns — Trivy does its own matching.
+          SKIPDIRS="**/node_modules,**/.venv,**/vendor,infra/worker-layer/**,infra/.terraform/**,**/dist,**/build,**/.git"
+          trivy config . $SKIP --skip-dirs "$SKIPDIRS" --format json --severity "${{ inputs.severity }}" --quiet > trivy-config.json
+          # `fs` finds vulnerable dependencies and secrets. 8Manager drops whichever of these GitHub
+          # already surfaces on this repo, per repository, so the overlap is decided from what is
+          # actually enabled rather than assumed.
+          trivy fs . --skip-dirs "$SKIPDIRS" --format json --severity "${{ inputs.severity }}" \
+            --scanners vuln,secret --quiet > trivy-fs.json
+          jq -s '{Results: (map(.Results // []) | add)}' trivy-config.json trivy-fs.json > trivy.json
+          echo "trivy.json is $(wc -c < trivy.json) bytes"
+
+      - name: Opengrep SAST scan
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          RULES_DIR: ${{ runner.temp }}/opengrep-rules
+          # Opengrep 1.25 reads rule YAML with the ASCII codec and aborts on a non-UTF-8 locale — pin
+          # a UTF-8 locale so the rule load never crashes on a runner whose default is C/POSIX.
+          LC_ALL: C.UTF-8
+          LANG: C.UTF-8
+          PYTHONUTF8: "1"
+        run: |
+          set -uo pipefail
+          # SP-35: 8Manager's OWN static code analysis — the SAST axis Trivy (deps/IaC/secrets) does
+          # not cover. Opengrep is the LGPL fork of Semgrep's engine, chosen over Semgrep because
+          # Semgrep's registry rule licence forbids competing/SaaS use; its rules repo is the
+          # pre-relicence community ruleset. Local-first, like Trivy — run on the runner.
+          #
+          # Download the PINNED, checksum-verified binary rather than piping a remote installer into a
+          # shell: `curl … | bash` executes whatever the server returns, unverified (SonarCloud S8482).
+          # Bump OG_VER + OG_SHA together; the SHA is the release asset's published sha256 digest.
+          OG_VER="v1.25.0"
+          OG_SHA="9ac4aebb47ba3f7b0d8fc641ac8749cb6c2f253f616131a67d9631e00d4bea33"
+          OG="$RUNNER_TEMP/opengrep"
+          if curl -fsSL -o "$OG" \
+               "https://github.com/opengrep/opengrep/releases/download/${OG_VER}/opengrep_manylinux_x86" \
+             && echo "${OG_SHA}  ${OG}" | sha256sum -c -; then
+            chmod +x "$OG"
+          else
+            echo "::warning::Opengrep download or checksum failed; posting an empty SAST report."
+            OG=""
+          fi
+          # Cloned OUTSIDE the scanned tree so the rules themselves are not scanned as source.
+          git clone --depth 1 https://github.com/opengrep/opengrep-rules "$RULES_DIR" 2>/dev/null || true
+          # Code-analysis rulesets only: Trivy already owns Terraform/IaC, so running Semgrep's
+          # terraform rules too would double-count the same misconfig across two buckets.
+          CFG=""
+          for lang in python javascript typescript java go ruby php csharp; do
+            [ -d "$RULES_DIR/$lang" ] && CFG="$CFG --config $RULES_DIR/$lang"
+          done
+          # SAST must NEVER break the caller's build. On any failure — missing binary, rule-parse
+          # error, timeout — post an empty report so the rest of the scan (Trivy) still lands.
+          # Match Opengrep's severity to the scan policy: ERROR is HIGH, WARNING is MEDIUM. A
+          # HIGH,CRITICAL scan therefore runs ERROR only — including WARNING would contradict the
+          # policy AND is what made the self-scan (758 findings, 1.25 MB) blow past the 200 KB ingest
+          # cap. WARNING is added back only when the caller asks for MEDIUM. Vendored/build trees are
+          # already outside Opengrep's default walk, so no --exclude is needed.
+          OG_SEV="--severity ERROR"
+          case ",${{ inputs.severity }}," in *,MEDIUM,*) OG_SEV="$OG_SEV --severity WARNING";; esac
+          if [ -n "$OG" ] && [ -n "$CFG" ]; then
+            "$OG" scan $CFG $OG_SEV \
+              --json --quiet --timeout 60 . > semgrep-raw.json 2> semgrep.err || true
+          fi
+          # Drop two high-volume, low-signal style rules by check_id substring (robust to the config-path
+          # prefix, which --exclude-rule is not): the React i18n lint and the list string-concat smell
+          # are noise on a real codebase and crowd out genuine findings under the 200 KB ingest cap.
+          if jq -e '.results' semgrep-raw.json >/dev/null 2>&1; then
+            jq '{results: [.results[] | select((.check_id | test("jsx-not-internationalized|string-concat-in-list")) | not)]}' \
+              semgrep-raw.json > semgrep.json
+          else
+            echo "::warning::Opengrep produced no parseable report; posting an empty SAST report."
+            [ -f semgrep.err ] && tail -20 semgrep.err || true
+            echo '{"results":[]}' > semgrep.json
+          fi
+          echo "semgrep.json is $(wc -c < semgrep.json) bytes, $(jq '.results|length' semgrep.json) findings"
+
+      - name: Polaris audit (optional)
+        if: inputs.manifests-directory != ''
+        run: |
+          set -euo pipefail
+          curl -sfL "https://github.com/FairwindsOps/polaris/releases/latest/download/polaris_linux_amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin polaris
+          polaris audit --audit-path "${{ inputs.manifests-directory }}" --format json > polaris.json
+          echo "polaris.json is $(wc -c < polaris.json) bytes"
+
+      - name: Report findings to 8Manager (non-blocking)
+        continue-on-error: true
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          API_URL: ${{ inputs.api-url }}
+          SERVICE: ${{ inputs.service }}
+          SCAN_ROOT: ${{ inputs.working-directory }}
+        run: |
+          send() {
+            set -o pipefail
+            local id_token reports body code
+            id_token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=8manager-ingest" | jq -r '.value')
+            [ -n "$id_token" ] && [ "$id_token" != "null" ] || { echo "could not mint OIDC token"; return 1; }
+
+            # A scanner report is hundreds of KB. It must NEVER travel through argv — neither as
+            # `jq --argjson` nor as `curl -d "$body"` — or the runner dies with "Argument list too
+            # long" once a repository has real findings. Everything is built on disk and streamed.
+            jq -n --slurpfile t trivy.json '[{scanner:"trivy", report:$t[0]}]' > reports.json
+            if [ -f semgrep.json ]; then
+              jq -n --slurpfile r reports.json --slurpfile s semgrep.json \
+                '$r[0] + [{scanner:"semgrep", report:$s[0]}]' > reports.merged.json
+              mv reports.merged.json reports.json
+            fi
+            if [ -f polaris.json ]; then
+              jq -n --slurpfile r reports.json --slurpfile p polaris.json \
+                '$r[0] + [{scanner:"polaris", report:$p[0]}]' > reports.merged.json
+              mv reports.merged.json reports.json
+            fi
+            jq -n --slurpfile reports reports.json --arg repo "$GITHUB_REPOSITORY" \
+              --arg sha "$GITHUB_SHA" --arg svc "$SERVICE" --arg root "$SCAN_ROOT" \
+              '{repository:$repo, commit_sha:$sha, service:$svc, scan_root:$root, reports:$reports[0]}' \
+              > body.json
+            echo "payload is $(wc -c < body.json) bytes"
+
+            code=$(curl -sS -o /tmp/scan-resp -w '%{http_code}' -X POST "$API_URL/ingest/scan-results" \
+              -H "Authorization: Bearer $id_token" -H "Content-Type: application/json" \
+              --data-binary @body.json)
+            echo "8Manager /ingest/scan-results -> HTTP $code"
+            if [ "$code" = "413" ]; then
+              # An explicit refusal, not a silent truncation: the fix is to narrow the scan, and
+              # saying so beats a scorecard quietly built from half a report.
+              echo "::warning::Scan report too large. Raise the `severity` input (e.g. HIGH,CRITICAL)."
+              cat /tmp/scan-resp
+              return 1
+            fi
+            [ "$code" = "202" ] || { cat /tmp/scan-resp; return 1; }
+          }
+          if ! send; then
+            echo "::warning::8Manager scan report failed; continuing the pipeline (non-blocking)."
+          fi
