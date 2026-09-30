@@ -59,8 +59,11 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
         run: |
           set -euo pipefail
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sh -s -- -b /usr/local/bin
+          # Pinned: the installer script AND the Trivy version come from one release tag, so a push to
+          # Trivy's main can never change what runs here. The installer verifies the release checksum.
+          TRIVY_VERSION="v0.74.0"
+          curl -sfL "https://raw.githubusercontent.com/aquasecurity/trivy/${TRIVY_VERSION}/contrib/install.sh" \
+            | sh -s -- -b /usr/local/bin "${TRIVY_VERSION}"
           # `config` finds Terraform/Kubernetes/Dockerfile misconfiguration — the class GitHub-native
           # tooling does NOT cover, and the reason this scan exists.
           SKIP=""
@@ -166,8 +169,15 @@ jobs:
         if: inputs.manifests-directory != ''
         run: |
           set -euo pipefail
-          curl -sfL "https://github.com/FairwindsOps/polaris/releases/latest/download/polaris_linux_amd64.tar.gz" \
-            | tar -xz -C /usr/local/bin polaris
+          # Pinned + checksum-verified (never `releases/latest`: it changes under us — its asset name
+          # already did, which silently broke the unpinned download).
+          POLARIS_VERSION="10.2.5"
+          POLARIS_SHA256="21c979f649e9600ad41d907d188c6e01b2c7ae4dc0cdbf4df392120c950e1fca"
+          TGZ="$RUNNER_TEMP/polaris.tar.gz"
+          curl -sfL -o "$TGZ" \
+            "https://github.com/FairwindsOps/polaris/releases/download/v${POLARIS_VERSION}/polaris_${POLARIS_VERSION}_linux_amd64.tar.gz"
+          echo "${POLARIS_SHA256}  ${TGZ}" | sha256sum -c -
+          tar -xz -C /usr/local/bin -f "$TGZ" polaris
           polaris audit --audit-path "${{ inputs.manifests-directory }}" --format json > polaris.json
           echo "polaris.json is $(wc -c < polaris.json) bytes"
 
