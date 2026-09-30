@@ -41,9 +41,14 @@ jobs:
         run: |
           set -euo pipefail
           pip install --quiet tree-sitter "tree-sitter-language-pack>=0.9"
-          # The analyzer is published alongside this workflow in hugofe/8manager-actions, fetched read-only.
-          curl -sSfL "https://raw.githubusercontent.com/hugofe/8manager-actions/main/tools/structure_analyzer.py" \
+          # The analyzer is published alongside this workflow in 8manager/actions. Fetched at THIS
+          # release's tag and checksum-verified, so a later push can never change what runs here.
+          # Bump ANALYZER_REF + ANALYZER_SHA256 together with each release.
+          ANALYZER_REF="v1.0.0"
+          ANALYZER_SHA256="ac8cffcfd37ece871de2f5b487229c0750fbd217b82a93034117db8493c8823d"
+          curl -sSfL "https://raw.githubusercontent.com/8manager/actions/${ANALYZER_REF}/tools/structure_analyzer.py" \
             -o structure_analyzer.py
+          echo "${ANALYZER_SHA256}  structure_analyzer.py" | sha256sum -c -
           # Emits ONLY derived findings as JSON — the repo's source stays on this runner.
           python structure_analyzer.py . > findings.json
           python -c "import json;d=json.load(open('findings.json'));print('structure findings:',len(d['findings']))"

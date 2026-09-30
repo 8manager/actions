@@ -19,9 +19,16 @@ permissions:
   contents: read
 jobs:
   security:
-    uses: hugofe/8manager-actions/.github/workflows/8manager-security.yml@main
+    uses: 8manager/actions/.github/workflows/8manager-security.yml@v1
   quality:
-    uses: hugofe/8manager-actions/.github/workflows/8manager-quality.yml@main
+    uses: 8manager/actions/.github/workflows/8manager-quality.yml@v1
   structure:
-    uses: hugofe/8manager-actions/.github/workflows/8manager-structure.yml@main
+    uses: 8manager/actions/.github/workflows/8manager-structure.yml@v1
 ```
+
+## Versioning
+
+Releases are tagged `vX.Y.Z`, with a moving `v1` tag for the latest 1.x. The 8Manager app pins the
+generated workflow to a release **commit SHA** (with the version in a comment), so nothing changes in
+your CI until you merge an update — Dependabot (`github-actions` ecosystem) opens those PRs for you.
+Never reference `@main`.
