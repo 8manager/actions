@@ -82,7 +82,7 @@ jobs:
           # sent. Targets with nothing to report are dropped.
           jq -s '
             def refs: ((.References // [])[:3]);
-            {Results: (map(.Results // []) | add | map(
+            {Results: (map(.Results // []) | add // [] | map(
               {Target, Class,
                Misconfigurations: ((.Misconfigurations // []) | map(
                  {ID, Severity, Title, PrimaryURL, References: refs, Resolution,
