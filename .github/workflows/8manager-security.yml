@@ -76,7 +76,26 @@ jobs:
           # actually enabled rather than assumed.
           trivy fs . --skip-dirs "$SKIPDIRS" --format json --severity "${{ inputs.severity }}" \
             --scanners vuln,secret --quiet > trivy-fs.json
-          jq -s '{Results: (map(.Results // []) | add)}' trivy-config.json trivy-fs.json > trivy.json
+          # Keep ONLY the fields 8Manager reads (app/scan/normalize.py from_trivy). Raw Trivy JSON carries
+          # full advisories, CVSS vectors and every reference URL per CVE — on a real app that is ~1 MB
+          # and the ingest caps reports at 200 KB. A secret's `Match`/`Code` (the secret itself) is never
+          # sent. Targets with nothing to report are dropped.
+          jq -s '
+            def refs: ((.References // [])[:3]);
+            {Results: (map(.Results // []) | add | map(
+              {Target, Class,
+               Misconfigurations: ((.Misconfigurations // []) | map(
+                 {ID, Severity, Title, PrimaryURL, References: refs, Resolution,
+                  CauseMetadata: {Resource: .CauseMetadata.Resource,
+                                  Code: {Lines: ((.CauseMetadata.Code.Lines // [])[:20]
+                                                 | map({Number, Content, IsCause}))}}})),
+               Vulnerabilities: ((.Vulnerabilities // []) | map(
+                 {VulnerabilityID, Severity, Title, PkgName, PrimaryURL, References: refs,
+                  FixedVersion, InstalledVersion})),
+               Secrets: ((.Secrets // []) | map({RuleID, Severity, Title})),
+               Licenses: ((.Licenses // []) | map({Name, Severity, PkgName}))}
+              | select((.Misconfigurations + .Vulnerabilities + .Secrets + .Licenses) | length > 0)))}
+          ' trivy-config.json trivy-fs.json > trivy.json
           echo "trivy.json is $(wc -c < trivy.json) bytes"
 
       - name: Opengrep SAST scan
@@ -194,7 +213,7 @@ jobs:
             if [ "$code" = "413" ]; then
               # An explicit refusal, not a silent truncation: the fix is to narrow the scan, and
               # saying so beats a scorecard quietly built from half a report.
-              echo "::warning::Scan report too large. Raise the `severity` input (e.g. HIGH,CRITICAL)."
+              echo '::warning::Scan report too large. Raise the severity input (e.g. HIGH,CRITICAL).'
               cat /tmp/scan-resp
               return 1
             fi
