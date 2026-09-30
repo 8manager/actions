@@ -53,7 +53,7 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Trivy config + filesystem scan
         working-directory: ${{ inputs.working-directory }}
@@ -132,7 +132,11 @@ jobs:
             OG=""
           fi
           # Cloned OUTSIDE the scanned tree so the rules themselves are not scanned as source.
-          git clone --depth 1 https://github.com/opengrep/opengrep-rules "$RULES_DIR" 2>/dev/null || true
+          # Rules pinned to a commit: the ruleset decides what gets flagged, so it must not move under us.
+          RULES_SHA="f1d2b562b414783763fd02a6ed2736eaed622efa"
+          { git init -q "$RULES_DIR" && git -C "$RULES_DIR" fetch -q --depth 1 \
+              https://github.com/opengrep/opengrep-rules "$RULES_SHA" \
+            && git -C "$RULES_DIR" checkout -q FETCH_HEAD; } 2>/dev/null || true
           # Code-analysis rulesets only: Trivy already owns Terraform/IaC, so running Semgrep's
           # terraform rules too would double-count the same misconfig across two buckets.
           CFG=""

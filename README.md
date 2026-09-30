@@ -9,6 +9,7 @@ with GitHub OIDC — no secret is added to your repository.
 | `8manager-security.yml` | Trivy (dependencies, IaC misconfiguration, secrets) + Opengrep (SAST), optional Polaris |
 | `8manager-quality.yml` | Complexity (lizard) + duplication (jscpd), weighted by 90-day churn |
 | `8manager-structure.yml` | Semantic duplication + dead code (Tree-sitter); posts derived findings only, never source |
+| `8manager-drift.yml` | Terraform drift: runs `terraform plan` on a schedule in your pipeline (your credentials never leave it) and posts the plan |
 
 You normally don't add these by hand: the 8Manager app generates `.github/workflows/8manager-scan.yml`
 for each repository (Security / Code quality pages → Set up scan).

@@ -1,0 +1,150 @@
+name: 8Manager drift
+
+# SP-22 reusable workflow: detect infrastructure that changed WITHOUT code.
+#
+# Runs `terraform plan` on a schedule against unchanged code. An empty plan means reality matches
+# git; anything it wants to change is drift — a console edit, an out-of-band script, a provider
+# default that moved.
+#
+# It runs in the CALLER's pipeline, not in 8Manager. That is deliberate: a plan needs the customer's
+# backend state and provider credentials, and the alternative would mean holding standing write-path
+# credentials for every customer's infrastructure. Reusing the pipeline they already trust with those
+# credentials is a far smaller ask than becoming a second place they live.
+#
+# Reporting is NON-BLOCKING, like the other 8Manager workflows: a 8Manager outage must never break the caller.
+# `-detailed-exitcode` makes `terraform plan` exit 2 when there are changes, which is the normal and
+# expected case here — it must not be read as a failure.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory containing the Terraform root module."
+        type: string
+        default: "."
+      terraform-version:
+        description: "Terraform version to install."
+        type: string
+        # The CALLER's Terraform version: set it to the version your state was written with. "latest"
+        # is only a default for callers that don't care; it is their infrastructure's contract, not ours.
+        default: "latest"
+      api-url:
+        description: "Base URL of the 8Manager API (no trailing slash)."
+        type: string
+        default: "https://khnmus0i56.execute-api.us-east-1.amazonaws.com"
+      aws-role-arn:
+        description: "AWS IAM role to assume via OIDC for the Terraform backend/providers."
+        type: string
+        default: ""
+      aws-region:
+        description: "AWS region (used only when aws-role-arn is set)."
+        type: string
+        default: "us-east-1"
+      pre-plan-command:
+        description: >
+          Shell run in the working directory before `terraform plan`. Needed when the module cannot
+          be planned from a clean checkout — e.g. archive_file data sources that hash build outputs
+          (Lambda zips, rendered manifests). Without it those plans fail before drift is ever read.
+        type: string
+        default: ""
+
+permissions:
+  id-token: write # mint the 8manager-ingest OIDC token (and, optionally, the AWS one)
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        if: inputs.aws-role-arn != ''
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+
+      - name: Pre-plan build
+        if: inputs.pre-plan-command != ''
+        run: ${{ inputs.pre-plan-command }}
+
+      - name: Terraform plan -> plan.json
+        id: plan
+        run: |
+          set -euo pipefail
+          terraform init -input=false
+          # -detailed-exitcode: 0 = no changes, 2 = changes present (drift!), 1 = real error.
+          # Only 1 is a failure; 2 is the case this workflow exists to capture.
+          set +e
+          # -lock=false: this runs on a schedule and is read-only. Taking the state lock would block
+          # a real apply for the duration, so drift detection could stall a deploy — unacceptable for
+          # a background check. Plan refreshes state by default, which is what reading drift needs.
+          terraform plan -input=false -lock=false -detailed-exitcode -out=tf.plan
+          code=$?
+          set -e
+          if [ "$code" = "1" ]; then
+            echo "terraform plan failed"; exit 1
+          fi
+          terraform show -json tf.plan > plan.json
+          echo "changes=$([ "$code" = "2" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "plan.json is $(wc -c < plan.json) bytes (exit $code)"
+
+      - name: Report drift to 8Manager (non-blocking)
+        continue-on-error: true
+        env:
+          API_URL: ${{ inputs.api-url }}
+        run: |
+          # Best-effort: any failure becomes a ::warning:: and exit 0.
+          #
+          # The plan is posted even when there are NO changes. "We looked and found nothing" is a
+          # different fact from "we never looked", and only the first one lets the product tell a
+          # clean estate from a broken cron.
+          send() {
+            set -o pipefail
+            local id_token repo sha run size body code
+            id_token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=8manager-ingest" | jq -r '.value')
+            [ -n "$id_token" ] && [ "$id_token" != "null" ] || { echo "could not mint OIDC token"; return 1; }
+
+            repo="$GITHUB_REPOSITORY"
+            sha="$GITHUB_SHA"
+            run="$GITHUB_RUN_ID"
+            size=$(wc -c < plan.json)
+
+            if [ "$size" -le 5242880 ]; then
+              body=$(jq -n --slurpfile plan plan.json --arg repo "$repo" --arg sha "$sha" \
+                --arg run "$run" \
+                '{repository:$repo, commit_sha:$sha, run_id:$run, mode:"drift", plan:$plan[0]}')
+              printf '%s' "$body" > body.json
+              code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$API_URL/ingest/plan" \
+                -H "Authorization: Bearer $id_token" -H "Content-Type: application/json" \
+                --data-binary @body.json)
+            else
+              local presign upload_url s3_key meta
+              meta=$(jq -n --arg repo "$repo" --arg sha "$sha" '{repository:$repo, commit_sha:$sha}')
+              presign=$(curl -sS -X POST "$API_URL/ingest/plan/presign" \
+                -H "Authorization: Bearer $id_token" -H "Content-Type: application/json" -d "$meta")
+              upload_url=$(echo "$presign" | jq -r '.upload_url')
+              s3_key=$(echo "$presign" | jq -r '.s3_key')
+              [ -n "$upload_url" ] && [ "$upload_url" != "null" ] || { echo "no presign url"; return 1; }
+              curl -sS -X PUT --upload-file plan.json -H "Content-Type: application/json" "$upload_url" || return 1
+              body=$(jq -n --arg repo "$repo" --arg sha "$sha" --arg run "$run" --arg key "$s3_key" \
+                '{repository:$repo, commit_sha:$sha, run_id:$run, mode:"drift", s3_key:$key}')
+              printf '%s' "$body" > body.json
+              code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$API_URL/ingest/plan" \
+                -H "Authorization: Bearer $id_token" -H "Content-Type: application/json" \
+                --data-binary @body.json)
+            fi
+            echo "8Manager /ingest/plan (drift) -> HTTP $code"
+            [ "$code" = "202" ] || return 1
+          }
+          if ! send; then
+            echo "::warning::8Manager drift report failed; continuing the pipeline (non-blocking)."
+          fi

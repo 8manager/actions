@@ -26,19 +26,19 @@ jobs:
     env:
       API_URL: ${{ inputs.api-url }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Full history so per-file churn (git log over the last 90 days) is real, not shallow.
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
       - name: Analyze complexity with lizard
         run: |
           set -euo pipefail
-          pip install --quiet lizard
+          pip install --quiet lizard==1.24.0
           git log --since="90 days ago" --name-only --pretty=format: -- . \
             | grep -v '^$' | sort | uniq -c | awk '{c=$1; $1=""; sub(/^ /,""); print c"\t"$0}' \
             > churn.tsv || true
@@ -118,7 +118,7 @@ jobs:
         continue-on-error: true
         run: |
           set -o pipefail
-          npx --yes jscpd@4 . --reporters json --silent --gitignore \
+          npx --yes jscpd@4.3.0 . --reporters json --silent --gitignore \
             --ignore "**/node_modules/**,**/.venv/**,**/venv/**,**/dist/**,**/build/**,**/worker-layer/**,**/.terraform/**,**/site-packages/**" \
             --output /tmp/jscpd >/dev/null 2>&1 || true
           if [ -f /tmp/jscpd/jscpd-report.json ]; then
