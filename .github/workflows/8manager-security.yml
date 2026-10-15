@@ -53,9 +53,45 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
+      # Pull requests (SP-103): scan the PR's HEAD — not GitHub's temporary merge commit — and tell 8Manager which PR
+      # and which base (merge-base) commit it is, so it can show what the change would introduce. A pull request from
+      # a fork gets no OIDC token, so there is nothing to report to: the scan is skipped with a notice.
+      - name: Pull request context
+        id: ctx
+        continue-on-error: true # non-blocking: without it the report is refused, the build is never failed
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_TIP: ${{ github.event.pull_request.base.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "kind=main" >> "$GITHUB_OUTPUT"; echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$HEAD_REPO" != "$REPO" ]; then
+            echo "::notice::8Manager security scan skipped: pull requests from forks get no OIDC token to report with."
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # The merge-base, from the compare API (read-only, the job's own token). Unknown -> empty: 8Manager then
+          # says it has no base scan to compare with, never "clean".
+          BASE=$(curl -sS -m 20 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/compare/$BASE_TIP...$HEAD_SHA" | jq -r '.merge_base_commit.sha // empty' || true)
+          echo "kind=pr" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "pr=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: steps.ctx.outputs.skip != 'true'
+        with:
+          ref: ${{ steps.ctx.outputs.kind == 'pr' && steps.ctx.outputs.head || github.sha }}
 
       - name: Trivy config + filesystem scan
+        if: steps.ctx.outputs.skip != 'true'
         continue-on-error: true # non-blocking: a scanner failure must never fail the caller's build
         working-directory: ${{ inputs.working-directory }}
         env:
@@ -109,6 +145,7 @@ jobs:
           echo "trivy.json is $(wc -c < trivy.json) bytes"
 
       - name: Opengrep SAST scan
+        if: steps.ctx.outputs.skip != 'true'
         working-directory: ${{ inputs.working-directory }}
         env:
           SEVERITY: ${{ inputs.severity }}
@@ -178,7 +215,7 @@ jobs:
           echo "semgrep.json is $(wc -c < semgrep.json) bytes, $(jq '.results|length' semgrep.json) findings"
 
       - name: Polaris audit (optional)
-        if: inputs.manifests-directory != ''
+        if: steps.ctx.outputs.skip != 'true' && inputs.manifests-directory != ''
         continue-on-error: true
         env:
           MANIFESTS_DIR: ${{ inputs.manifests-directory }}
@@ -197,12 +234,17 @@ jobs:
           echo "polaris.json is $(wc -c < polaris.json) bytes"
 
       - name: Report findings to 8Manager (non-blocking)
+        if: steps.ctx.outputs.skip != 'true'
         continue-on-error: true
         working-directory: ${{ inputs.working-directory }}
         env:
           API_URL: ${{ inputs.api-url }}
           SERVICE: ${{ inputs.service }}
           SCAN_ROOT: ${{ inputs.working-directory }}
+          KIND: ${{ steps.ctx.outputs.kind }}
+          PR_NUMBER: ${{ steps.ctx.outputs.pr }}
+          HEAD_SHA: ${{ steps.ctx.outputs.head }}
+          BASE_SHA: ${{ steps.ctx.outputs.base }}
         run: |
           send() {
             set -o pipefail
@@ -229,6 +271,13 @@ jobs:
               --arg sha "$GITHUB_SHA" --arg svc "$SERVICE" --arg root "$SCAN_ROOT" \
               '{repository:$repo, commit_sha:$sha, service:$svc, scan_root:$root, reports:$reports[0]}' \
               > body.json
+            # A pull-request head scan is its own kind: 8Manager keeps it apart from the default branch's history.
+            if [ "$KIND" = "pr" ]; then
+              jq --argjson pr "$PR_NUMBER" --arg head "$HEAD_SHA" --arg base "$BASE_SHA" \
+                '. + {kind:"pr", pr_number:$pr, head_sha:$head, commit_sha:$head}
+                   + (if $base == "" then {} else {base_sha:$base} end)' body.json > body.pr.json
+              mv body.pr.json body.json
+            fi
             echo "payload is $(wc -c < body.json) bytes"
 
             code=$(curl -sS -o /tmp/scan-resp -w '%{http_code}' -X POST "$API_URL/ingest/scan-results" \
