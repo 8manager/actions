@@ -1,0 +1,28 @@
+name: White-label check
+
+# The workflows here run in customers' CI: every step name, input description and echoed message they see in their
+# Actions log says "8Manager", never the underlying tool. Commands and internal comments may name the tools.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: No tool names in customer-visible text
+        run: |
+          DENY='trivy|opengrep|semgrep|lizard|grype|checkov|osv-scanner|polaris|jscpd'
+          # Step names, input descriptions and echo messages ($(...) command substitutions removed).
+          LEAKS=$(grep -nE '^\s*(- )?(name|description):|echo +"' .github/workflows/8manager-*.yml \
+            | sed -E 's/\$\([^)]*\)//g' | grep -iE "$DENY" || true)
+          if [ -n "$LEAKS" ]; then
+            echo "Customer-visible text names an underlying tool:"; echo "$LEAKS"; exit 1
+          fi
+          echo "clean"

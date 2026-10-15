@@ -22,7 +22,7 @@ on:
         type: string
         default: "."
       severity:
-        description: "Minimum Trivy severity to report. Narrow this if reports exceed the size cap."
+        description: "Minimum severity to report. Narrow this if reports exceed the size cap."
         type: string
         default: "MEDIUM,HIGH,CRITICAL"
       service:
@@ -30,7 +30,7 @@ on:
         type: string
         default: ""
       manifests-directory:
-        description: "Optional: rendered Kubernetes manifests for Polaris to audit."
+        description: "Optional: rendered Kubernetes manifests for the 8Manager Kubernetes audit."
         type: string
         default: ""
       skip-check-update:
@@ -90,7 +90,7 @@ jobs:
         with:
           ref: ${{ steps.ctx.outputs.kind == 'pr' && steps.ctx.outputs.head || github.sha }}
 
-      - name: Trivy config + filesystem scan
+      - name: 8Manager security scan (dependencies, IaC, secrets)
         if: steps.ctx.outputs.skip != 'true'
         continue-on-error: true # non-blocking: a scanner failure must never fail the caller's build
         working-directory: ${{ inputs.working-directory }}
@@ -101,11 +101,11 @@ jobs:
           set -euo pipefail
           # Pinned binary + sha256 (no installer script): nothing Trivy publishes later changes what runs here.
           TRIVY_VERSION="0.74.0"
-          TRIVY_SHA256="2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a"
-          TGZ="$RUNNER_TEMP/trivy.tar.gz"
+          SEC_TOOL_SHA256="2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a"
+          TGZ="$RUNNER_TEMP/8m-security.tar.gz"
           curl -sfL -o "$TGZ" \
             "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-          echo "${TRIVY_SHA256}  ${TGZ}" | sha256sum -c -
+          echo "${SEC_TOOL_SHA256}  ${TGZ}" | sha256sum -c -
           tar -xz -C /usr/local/bin -f "$TGZ" trivy
           # `config` finds Terraform/Kubernetes/Dockerfile misconfiguration — the class GitHub-native
           # tooling does NOT cover, and the reason this scan exists.
@@ -142,9 +142,9 @@ jobs:
                Licenses: ((.Licenses // []) | map({Name, Severity, PkgName}))}
               | select((.Misconfigurations + .Vulnerabilities + .Secrets + .Licenses) | length > 0)))}
           ' trivy-config.json trivy-fs.json > trivy.json
-          echo "trivy.json is $(wc -c < trivy.json) bytes"
+          echo "security report is $(wc -c < trivy.json) bytes"
 
-      - name: Opengrep SAST scan
+      - name: 8Manager SAST
         if: steps.ctx.outputs.skip != 'true'
         working-directory: ${{ inputs.working-directory }}
         env:
@@ -167,13 +167,13 @@ jobs:
           # Bump OG_VER + OG_SHA together; the SHA is the release asset's published sha256 digest.
           OG_VER="v1.25.0"
           OG_SHA="9ac4aebb47ba3f7b0d8fc641ac8749cb6c2f253f616131a67d9631e00d4bea33"
-          OG="$RUNNER_TEMP/opengrep"
+          OG="$RUNNER_TEMP/8m-sast"
           if curl -fsSL -o "$OG" \
                "https://github.com/opengrep/opengrep/releases/download/${OG_VER}/opengrep_manylinux_x86" \
              && echo "${OG_SHA}  ${OG}" | sha256sum -c -; then
             chmod +x "$OG"
           else
-            echo "::warning::Opengrep download or checksum failed; posting an empty SAST report."
+            echo "::warning::The 8Manager SAST engine could not be downloaded or verified; posting an empty SAST report."
             OG=""
           fi
           # Cloned OUTSIDE the scanned tree so the rules themselves are not scanned as source.
@@ -208,13 +208,13 @@ jobs:
             jq '{results: [.results[] | select((.check_id | test("jsx-not-internationalized|string-concat-in-list")) | not)]}' \
               semgrep-raw.json > semgrep.json
           else
-            echo "::warning::Opengrep produced no parseable report; posting an empty SAST report."
+            echo "::warning::The 8Manager SAST engine produced no parseable report; posting an empty SAST report."
             [ -f semgrep.err ] && tail -20 semgrep.err || true
             echo '{"results":[]}' > semgrep.json
           fi
-          echo "semgrep.json is $(wc -c < semgrep.json) bytes, $(jq '.results|length' semgrep.json) findings"
+          echo "SAST report is $(wc -c < semgrep.json) bytes, $(jq '.results|length' semgrep.json) findings"
 
-      - name: Polaris audit (optional)
+      - name: 8Manager Kubernetes audit (optional)
         if: steps.ctx.outputs.skip != 'true' && inputs.manifests-directory != ''
         continue-on-error: true
         env:
@@ -224,14 +224,14 @@ jobs:
           # Pinned + checksum-verified (never `releases/latest`: it changes under us — its asset name
           # already did, which silently broke the unpinned download).
           POLARIS_VERSION="10.2.5"
-          POLARIS_SHA256="21c979f649e9600ad41d907d188c6e01b2c7ae4dc0cdbf4df392120c950e1fca"
-          TGZ="$RUNNER_TEMP/polaris.tar.gz"
+          K8S_TOOL_SHA256="21c979f649e9600ad41d907d188c6e01b2c7ae4dc0cdbf4df392120c950e1fca"
+          TGZ="$RUNNER_TEMP/8m-k8s-audit.tar.gz"
           curl -sfL -o "$TGZ" \
             "https://github.com/FairwindsOps/polaris/releases/download/v${POLARIS_VERSION}/polaris_${POLARIS_VERSION}_linux_amd64.tar.gz"
-          echo "${POLARIS_SHA256}  ${TGZ}" | sha256sum -c -
+          echo "${K8S_TOOL_SHA256}  ${TGZ}" | sha256sum -c -
           tar -xz -C /usr/local/bin -f "$TGZ" polaris
           polaris audit --audit-path "$MANIFESTS_DIR" --format json > polaris.json
-          echo "polaris.json is $(wc -c < polaris.json) bytes"
+          echo "Kubernetes audit report is $(wc -c < polaris.json) bytes"
 
       - name: Report findings to 8Manager (non-blocking)
         if: steps.ctx.outputs.skip != 'true'

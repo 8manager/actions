@@ -35,7 +35,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Analyze complexity with lizard
+      - name: 8Manager complexity analysis
         continue-on-error: true # non-blocking
         run: |
           set -euo pipefail
@@ -115,7 +115,7 @@ jobs:
           echo "summary: $(cat summary.json)"
           echo "hotspots: $(wc -c < hotspots.json) bytes"
 
-      - name: Detect duplication with jscpd
+      - name: 8Manager duplication analysis
         continue-on-error: true
         run: |
           set -o pipefail
