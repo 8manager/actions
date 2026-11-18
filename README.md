@@ -6,7 +6,7 @@ with GitHub OIDC — no secret is added to your repository.
 
 | Workflow | What it does |
 |---|---|
-| `8manager-security.yml` | Trivy (dependencies, IaC misconfiguration, secrets) + Opengrep (SAST), optional Polaris |
+| `8manager-security.yml` | Trivy (dependencies, IaC misconfiguration, secrets) + Opengrep (SAST) with 8Manager's own rules (`rules/`), optional Polaris |
 | `8manager-quality.yml` | Complexity (lizard) + duplication (jscpd), weighted by 90-day churn |
 | `8manager-structure.yml` | Semantic duplication + dead code (Tree-sitter); posts derived findings only, never source |
 | `8manager-drift.yml` | Terraform drift: runs `terraform plan` on a schedule in your pipeline (your credentials never leave it) and posts the plan |
@@ -38,7 +38,7 @@ What the workflows themselves pin:
 
 - **Third-party actions** — by commit SHA (version in a comment).
 - **Trivy, Opengrep, Polaris binaries and the structure analyzer** — exact version/commit + sha256 checked.
-- **Opengrep rules** — a fixed commit of `opengrep/opengrep-rules`.
+- **Opengrep rules** — a fixed commit of `opengrep/opengrep-rules`, plus 8Manager's own `rules/` at a fixed commit of this repo (`EM_RULES_REF`).
 - **Python / npm packages** (lizard, tree-sitter, tree-sitter-language-pack, jscpd) — exact versions
   (`==` / `@x.y.z`), without a hash lockfile; their transitive dependencies and the grammars
   `tree-sitter-language-pack` downloads at run time are resolved by their registries.
