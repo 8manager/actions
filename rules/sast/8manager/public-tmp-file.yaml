@@ -1,0 +1,22 @@
+rules:
+  - id: public-tmp-file
+    languages: [javascript, typescript, python]
+    severity: WARNING
+    message: >-
+      A fixed file name in a world-writable directory (/tmp, /var/tmp, /dev/shm) can be pre-created or
+      replaced by a symlink by another user on the same host. Create a private file or directory
+      instead (fs.mkdtemp / tempfile.mkstemp / tempfile.TemporaryDirectory).
+    # Test code is not shipped: fixture tokens, deliberate http:// cases and scratch files are expected there.
+    paths:
+      exclude: ["*.test.*", "*.spec.*", "**/__tests__/**", "**/__mocks__/**", "**/fixtures/**"]
+    metadata:
+      category: security
+      cwe: ["CWE-377: Insecure Temporary File"]
+      owasp: ["A01:2021 - Broken Access Control"]
+      references: ["https://cwe.mitre.org/data/definitions/377.html"]
+      confidence: MEDIUM
+    patterns:
+      - pattern: '"$P"'
+      - metavariable-regex:
+          metavariable: $P
+          regex: ^/(tmp|var/tmp|dev/shm|usr/tmp)/[^\s]+$

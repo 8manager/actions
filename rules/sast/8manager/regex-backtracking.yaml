@@ -1,0 +1,19 @@
+rules:
+  - id: regex-backtracking
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      This regular expression repeats a group that itself contains a repetition, which can backtrack
+      exponentially on a crafted input and freeze the thread (ReDoS). Make the alternatives
+      mutually exclusive, use a possessive/atomic form, or bound the input length.
+    # Test code is not shipped: fixture tokens, deliberate http:// cases and scratch files are expected there.
+    paths:
+      exclude: ["*.test.*", "*.spec.*", "**/__tests__/**", "**/__mocks__/**", "**/fixtures/**"]
+    metadata:
+      category: security
+      cwe: ["CWE-1333: Inefficient Regular Expression Complexity"]
+      owasp: ["A05:2021 - Security Misconfiguration"]
+      references: ["https://cwe.mitre.org/data/definitions/1333.html"]
+      confidence: LOW
+    # A regex literal (after =, (, ,, :, return, etc.) containing "( ...x* or x+ ... )" followed by * + or {n,}.
+    pattern-regex: (?:[=(,:!&|?;{}]|\breturn)\s*/(?![/*\s])(?:[^/\\\n\[]|\\.|\[(?:[^\]\\\n]|\\.)*\])*?\((?:[^()\\\n\[]|\\.|\[(?:[^\]\\\n]|\\.)*\])*[*+](?:[^()\\\n\[]|\\.|\[(?:[^\]\\\n]|\\.)*\])*\)(?:[*+]|\{\d+,\})

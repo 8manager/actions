@@ -52,6 +52,11 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    env:
+      # 8Manager's own rules (rules/ in this repository), pinned to a commit: like the community
+      # ruleset, what gets flagged must not move under the caller. Bump with every rules change.
+      EM_RULES_REF: "89afeeb5fb6c956ba3fd187fbbed98c562f21b67"
+      EM_RULES_DIR: ${{ runner.temp }}/8m-rules
     steps:
       # Pull requests (SP-103): scan the PR's HEAD — not GitHub's temporary merge commit — and tell 8Manager which PR
       # and which base (merge-base) commit it is, so it can show what the change would introduce. A pull request from
@@ -90,6 +95,15 @@ jobs:
         with:
           ref: ${{ steps.ctx.outputs.kind == 'pr' && steps.ctx.outputs.head || github.sha }}
 
+      - name: 8Manager rules
+        if: steps.ctx.outputs.skip != 'true'
+        continue-on-error: true # non-blocking: without them the scan still runs on the base rulesets
+        run: |
+          { git init -q "$EM_RULES_DIR" && git -C "$EM_RULES_DIR" fetch -q --depth 1 \
+              https://github.com/8manager/actions "$EM_RULES_REF" \
+            && git -C "$EM_RULES_DIR" checkout -q FETCH_HEAD; } 2>/dev/null \
+            || echo "::warning::8Manager rules could not be fetched; scanning with the base rules only."
+
       - name: 8Manager security scan (dependencies, IaC, secrets)
         if: steps.ctx.outputs.skip != 'true'
         continue-on-error: true # non-blocking: a scanner failure must never fail the caller's build
@@ -120,8 +134,13 @@ jobs:
           # `fs` finds vulnerable dependencies and secrets. 8Manager drops whichever of these GitHub
           # already surfaces on this repo, per repository, so the overlap is decided from what is
           # actually enabled rather than assumed.
+          # 8Manager's generic secret rule for config files (.env, YAML, JSON, ini) on top of the
+          # built-in provider-specific ones. Optional: absent rules never block the scan.
+          SECRET_CFG=""
+          [ -f "$EM_RULES_DIR/rules/secrets/secret-config.yaml" ] \
+            && SECRET_CFG="--secret-config $EM_RULES_DIR/rules/secrets/secret-config.yaml"
           trivy fs . --skip-dirs "$SKIPDIRS" --format json --severity "$SEVERITY" \
-            --scanners vuln,secret --quiet > trivy-fs.json
+            --scanners vuln,secret $SECRET_CFG --quiet > trivy-fs.json
           # Keep ONLY the fields 8Manager reads (app/scan/normalize.py from_trivy). Raw Trivy JSON carries
           # full advisories, CVSS vectors and every reference URL per CVE — on a real app that is ~1 MB
           # and the ingest caps reports at 200 KB. A secret's `Match`/`Code` (the secret itself) is never
@@ -188,6 +207,13 @@ jobs:
           for lang in python javascript typescript java go ruby php csharp; do
             [ -d "$RULES_DIR/$lang" ] && CFG="$CFG --config $RULES_DIR/$lang"
           done
+          # 8Manager's own rules (secrets, weak crypto, cleartext, temp files, ReDoS). Copied under the
+          # rules dir so their ids read "8manager.<rule>" once normalized. Rule YAML only, no test files.
+          if [ -d "$EM_RULES_DIR/rules/sast/8manager" ]; then
+            mkdir -p "$RULES_DIR/8manager"
+            cp "$EM_RULES_DIR"/rules/sast/8manager/*.yaml "$RULES_DIR/8manager/"
+            CFG="$CFG --config $RULES_DIR/8manager"
+          fi
           # SAST must NEVER break the caller's build. On any failure — missing binary, rule-parse
           # error, timeout — post an empty report so the rest of the scan (Trivy) still lands.
           # Match Opengrep's severity to the scan policy: ERROR is HIGH, WARNING is MEDIUM. A
@@ -201,11 +227,26 @@ jobs:
             "$OG" scan $CFG $OG_SEV \
               --json --quiet --timeout 60 . > semgrep-raw.json 2> semgrep.err || true
           fi
-          # Drop two high-volume, low-signal style rules by check_id substring (robust to the config-path
-          # prefix, which --exclude-rule is not): the React i18n lint and the list string-concat smell
-          # are noise on a real codebase and crowd out genuine findings under the 200 KB ingest cap.
+          # Drop high-volume, low-signal style rules by check_id substring (robust to the config-path
+          # prefix, which --exclude-rule is not): i18n lint, prop spreading, list string-concat and the
+          # obsolete replaceAll portability check are noise on a real codebase (4,300+ i18n findings on
+          # one repo) and crowd out genuine findings under the 200 KB ingest cap.
+          # Keep only the fields 8Manager reads, and NEVER the matched text of a secret finding: its
+          # lines and metavariables would carry the credential itself.
+          NOISE="jsx-not-internationalized|string-concat-in-list|i18next-key-format|react-props-spreading|no-replaceall"
           if jq -e '.results' semgrep-raw.json >/dev/null 2>&1; then
-            jq '{results: [.results[] | select((.check_id | test("jsx-not-internationalized|string-concat-in-list")) | not)]}' \
+            jq -c --arg noise "$NOISE" '{results: [.results[]
+                | select((.check_id | test($noise)) | not)
+                | (.extra.metadata // {}) as $m
+                | ((($m.subcategory // []) | tostring | test("secret"))
+                   or (($m.cwe // []) | tostring | test("CWE-798"))) as $secret
+                | {check_id, path, start: {line: .start.line}, end: {line: .end.line},
+                   extra: {severity: .extra.severity, message: ((.extra.message // "")[0:500]),
+                           fix: (if $secret then null else .extra.fix end),
+                           lines: (if $secret then "" else ((.extra.lines // "")[0:600]) end),
+                           metadata: {category: $m.category, subcategory: $m.subcategory, cwe: $m.cwe,
+                                      owasp: $m.owasp, confidence: $m.confidence,
+                                      references: (($m.references // [])[0:3])}}}]}' \
               semgrep-raw.json > semgrep.json
           else
             echo "::warning::The 8Manager SAST engine produced no parseable report; posting an empty SAST report."
