@@ -1,0 +1,39 @@
+rules:
+  - id: insecure-random
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      Math.random() is predictable and must not produce secrets, tokens, keys, nonces, salts or
+      identifiers an attacker could guess. Use crypto.getRandomValues() / crypto.randomUUID() (browser)
+      or crypto.randomBytes() (Node).
+    # Test code is not shipped: fixture tokens, deliberate http:// cases and scratch files are expected there.
+    paths:
+      exclude: ["*.test.*", "*.spec.*", "**/__tests__/**", "**/__mocks__/**", "**/fixtures/**"]
+    metadata:
+      category: security
+      cwe: ["CWE-338: Use of Cryptographically Weak Pseudo-Random Number Generator (PRNG)"]
+      owasp: ["A02:2021 - Cryptographic Failures"]
+      references: ["https://cwe.mitre.org/data/definitions/338.html"]
+      confidence: MEDIUM
+    patterns:
+      - pattern: Math.random()
+      - pattern-either:
+          # Filling a byte buffer: that buffer is a key, a nonce or an identifier.
+          - pattern-inside: $BUF[$I] = <... Math.random() ...>;
+          - patterns:
+              - pattern-either:
+                  - pattern-inside: |
+                      function $F(...) { ... }
+                  - pattern-inside: |
+                      $F = (...) => { ... }
+                  - pattern-inside: |
+                      $F = (...) => $E
+                  - pattern-inside: |
+                      const $F = <... Math.random() ...>;
+                  - pattern-inside: |
+                      let $F = <... Math.random() ...>;
+                  - pattern-inside: |
+                      $O.$F = <... Math.random() ...>;
+              - metavariable-regex:
+                  metavariable: $F
+                  regex: (?i).*(token|secret|nonce|salt|passw|otp|session|uuid|guid|idempot|apikey|api_key|signing|csrf|random_?bytes|randombytes).*
